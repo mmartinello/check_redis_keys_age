@@ -400,31 +400,38 @@ def main():
         critical=args.critical,
     )
 
-    # Evaluate critical threshold first (higher severity wins).
-    if args.critical is not None and oldest_age >= args.critical:
-        exit_plugin(
-            STATE_CRITICAL,
-            f"Key '{oldest_key}' is {oldest_age}s old "
-            f"(critical threshold: {args.critical}s), "
-            f"{num_keys} matching key(s) found",
-            perfdata=perfdata,
-        )
-
-    if args.warning is not None and oldest_age >= args.warning:
-        exit_plugin(
-            STATE_WARNING,
-            f"Key '{oldest_key}' is {oldest_age}s old "
-            f"(warning threshold: {args.warning}s), "
-            f"{num_keys} matching key(s) found",
-            perfdata=perfdata,
-        )
-
-    exit_plugin(
-        STATE_OK,
-        f"{num_keys} key(s) matching '{args.pattern}', "
-        f"oldest key '{oldest_key}' is {oldest_age}s old",
-        perfdata=perfdata,
+    # Count keys exceeding each threshold (warning bucket excludes critical).
+    crit_count = sum(1 for age in key_ages.values() if args.critical is not None and age >= args.critical)
+    warn_count = sum(
+        1 for age in key_ages.values()
+        if args.warning is not None and age >= args.warning
+        and (args.critical is None or age < args.critical)
     )
+
+    # Determine state (critical takes precedence).
+    if crit_count > 0:
+        state = STATE_CRITICAL
+    elif warn_count > 0:
+        state = STATE_WARNING
+    else:
+        state = STATE_OK
+
+    # Build message.
+    if state == STATE_OK:
+        message = f"{num_keys} matching key(s), no keys older than thresholds"
+    else:
+        parts = []
+        if warn_count > 0:
+            parts.append(f"{warn_count} keys older than {args.warning}s [WARNING]")
+        if crit_count > 0:
+            parts.append(f"{crit_count} keys older than {args.critical}s [CRITICAL]")
+        message = (
+            f"{num_keys} matching key(s) found, "
+            + ", ".join(parts)
+            + f" (oldest: '{oldest_key}', {oldest_age}s)"
+        )
+
+    exit_plugin(state, message, perfdata=perfdata)
 
 
 if __name__ == "__main__":

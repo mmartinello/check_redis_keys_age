@@ -145,21 +145,24 @@ def compile_pattern(pattern):
         exit_plugin(STATE_UNKNOWN, f"Invalid regular expression '{pattern}': {exc}")
 
 
-def scan_matching_keys(client, regex):
+def scan_matching_keys(client, regex, scan_count):
     """
     Iterate over all keys in the database using SCAN (non-blocking) and
     return those whose names match *regex*.
 
     SCAN is preferred over KEYS because it does not block the Redis event
     loop, making it safe to run against production instances.
+
+    *scan_count* is passed as the COUNT hint to SCAN; higher values reduce
+    round trips at the cost of slightly more memory per batch.
     """
     matches = []
     cursor = 0
     total_scanned = 0
 
-    logger.debug("Starting SCAN over all keys (batch size=100)")
+    logger.debug("Starting SCAN over all keys (batch size=%d)", scan_count)
     while True:
-        cursor, keys = client.scan(cursor=cursor, count=100)
+        cursor, keys = client.scan(cursor=cursor, count=scan_count)
         total_scanned += len(keys)
         logger.debug("SCAN batch: %d keys returned, cursor=%d", len(keys), cursor)
         for raw_key in keys:
@@ -174,47 +177,31 @@ def scan_matching_keys(client, regex):
     return matches
 
 
-def get_idle_time(client, key):
+def get_idle_times(client, keys):
     """
-    Return OBJECT IDLETIME for *key* (seconds since last access).
+    Return a dict {key: idle_seconds} for all *keys* in a single pipeline
+    round trip using OBJECT IDLETIME.
 
-    Tries the API in order of preference to stay compatible across redis-py
-    versions (the method was renamed between major releases):
-      - redis-py >= 7: client.object("idletime", key)
-      - redis-py < 7:  client.object_idletime(key)
-      - fallback:      client.execute_command("OBJECT", "IDLETIME", key)
-
-    Returns None if the key no longer exists or if the command is
-    unavailable (some managed Redis services disable it).
+    Keys that no longer exist or return an error are omitted from the result.
+    Using transaction=False avoids wrapping the pipeline in MULTI/EXEC, which
+    is unnecessary here and would add overhead.
     """
-    logger.debug("Fetching OBJECT IDLETIME for key: %s", key)
+    logger.debug("Fetching OBJECT IDLETIME for %d key(s) via pipeline", len(keys))
+    pipe = client.pipeline(transaction=False)
+    for key in keys:
+        pipe.execute_command("OBJECT", "IDLETIME", key)
+    raw = pipe.execute(raise_on_error=False)
 
-    # redis-py >= 7
-    if hasattr(client, "object") and callable(client.object):
-        try:
-            age = client.object("idletime", key)
-            logger.debug("Key '%s' idle time: %ss (via client.object)", key, age)
-            return age
-        except (RedisResponseError, Exception):
-            pass
+    result = {}
+    for key, age in zip(keys, raw):
+        if isinstance(age, int):
+            logger.debug("Key '%s' idle time: %ds", key, age)
+            result[key] = age
+        else:
+            logger.debug("Could not determine idle time for key '%s': %s", key, age)
 
-    # redis-py < 7
-    if hasattr(client, "object_idletime"):
-        try:
-            age = client.object_idletime(key)
-            logger.debug("Key '%s' idle time: %ss (via object_idletime)", key, age)
-            return age
-        except (RedisResponseError, Exception):
-            pass
-
-    # universal fallback via raw command
-    try:
-        age = client.execute_command("OBJECT", "IDLETIME", key)
-        logger.debug("Key '%s' idle time: %ss (via execute_command)", key, age)
-        return age
-    except Exception:
-        logger.debug("Could not determine idle time for key: %s", key)
-        return None
+    logger.debug("Pipeline complete: %d/%d idle times retrieved", len(result), len(keys))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +301,14 @@ EXAMPLES
         help="Connection/socket timeout in seconds (default: 10)",
     )
     opt.add_argument(
+        "--scan-count",
+        type=int,
+        default=1000,
+        metavar="N",
+        help="COUNT hint passed to each SCAN call (default: 1000); "
+             "higher values reduce round trips at the cost of more memory per batch",
+    )
+    opt.add_argument(
         "--debug",
         action="store_true",
         default=False,
@@ -366,7 +361,7 @@ def main():
     regex = compile_pattern(args.pattern)
 
     try:
-        matching_keys = scan_matching_keys(client, regex)
+        matching_keys = scan_matching_keys(client, regex, args.scan_count)
     except Exception as exc:
         exit_plugin(STATE_UNKNOWN, f"Error scanning Redis keys: {exc}")
 
@@ -382,12 +377,8 @@ def main():
 
     logger.debug("Fetching idle times for %d matched key(s)", len(matching_keys))
 
-    # Collect idle times for every matched key.
-    key_ages = {}
-    for key in matching_keys:
-        age = get_idle_time(client, key)
-        if age is not None:
-            key_ages[key] = age
+    # Collect idle times for every matched key in a single pipeline round trip.
+    key_ages = get_idle_times(client, matching_keys)
 
     if not key_ages:
         exit_plugin(

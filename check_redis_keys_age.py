@@ -27,6 +27,7 @@ Exit codes (Nagios/Icinga standard):
 import sys
 import re
 import argparse
+import logging
 
 # ---------------------------------------------------------------------------
 # Attempt to import the redis package; fail gracefully if missing.
@@ -46,9 +47,12 @@ except ImportError:
     )
     sys.exit(3)
 
+logger = logging.getLogger(__name__)
+
 # ---------------------------------------------------------------------------
 # Nagios/Icinga2 standard exit codes.
 # ---------------------------------------------------------------------------
+
 STATE_OK = 0
 STATE_WARNING = 1
 STATE_CRITICAL = 2
@@ -102,6 +106,7 @@ def connect_redis(host, port, db, password, timeout):
 
     Exits with UNKNOWN on any connection or authentication error.
     """
+    logger.debug("Connecting to Redis at %s:%d db=%d (timeout=%ds)", host, port, db, timeout)
     try:
         client = redis.Redis(
             host=host,
@@ -113,6 +118,7 @@ def connect_redis(host, port, db, password, timeout):
             decode_responses=False,
         )
         client.ping()
+        logger.debug("Connected to Redis successfully")
         return client
     except RedisConnectionError as exc:
         exit_plugin(STATE_UNKNOWN, f"Cannot connect to Redis at {host}:{port} - {exc}")
@@ -130,8 +136,11 @@ def compile_pattern(pattern):
 
     Exits with UNKNOWN if the expression is invalid.
     """
+    logger.debug("Compiling regex pattern: %s", pattern)
     try:
-        return re.compile(pattern)
+        compiled = re.compile(pattern)
+        logger.debug("Pattern compiled successfully")
+        return compiled
     except re.error as exc:
         exit_plugin(STATE_UNKNOWN, f"Invalid regular expression '{pattern}': {exc}")
 
@@ -146,16 +155,22 @@ def scan_matching_keys(client, regex):
     """
     matches = []
     cursor = 0
+    total_scanned = 0
 
+    logger.debug("Starting SCAN over all keys (batch size=100)")
     while True:
         cursor, keys = client.scan(cursor=cursor, count=100)
+        total_scanned += len(keys)
+        logger.debug("SCAN batch: %d keys returned, cursor=%d", len(keys), cursor)
         for raw_key in keys:
             key = raw_key.decode("utf-8") if isinstance(raw_key, bytes) else str(raw_key)
             if regex.search(key):
+                logger.debug("Key matched: %s", key)
                 matches.append(key)
         if cursor == 0:
             break
 
+    logger.debug("SCAN complete: %d keys scanned, %d matched", total_scanned, len(matches))
     return matches
 
 
@@ -172,24 +187,33 @@ def get_idle_time(client, key):
     Returns None if the key no longer exists or if the command is
     unavailable (some managed Redis services disable it).
     """
+    logger.debug("Fetching OBJECT IDLETIME for key: %s", key)
+
     # redis-py >= 7
     if hasattr(client, "object") and callable(client.object):
         try:
-            return client.object("idletime", key)
+            age = client.object("idletime", key)
+            logger.debug("Key '%s' idle time: %ss (via client.object)", key, age)
+            return age
         except (RedisResponseError, Exception):
             pass
 
     # redis-py < 7
     if hasattr(client, "object_idletime"):
         try:
-            return client.object_idletime(key)
+            age = client.object_idletime(key)
+            logger.debug("Key '%s' idle time: %ss (via object_idletime)", key, age)
+            return age
         except (RedisResponseError, Exception):
             pass
 
     # universal fallback via raw command
     try:
-        return client.execute_command("OBJECT", "IDLETIME", key)
+        age = client.execute_command("OBJECT", "IDLETIME", key)
+        logger.debug("Key '%s' idle time: %ss (via execute_command)", key, age)
+        return age
     except Exception:
+        logger.debug("Could not determine idle time for key: %s", key)
         return None
 
 
@@ -289,6 +313,12 @@ EXAMPLES
         metavar="SECONDS",
         help="Connection/socket timeout in seconds (default: 10)",
     )
+    opt.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help="Enable debug logging to stdout (default: disabled)",
+    )
 
     return parser.parse_args()
 
@@ -300,6 +330,15 @@ EXAMPLES
 def main():
     args = parse_args()
 
+    if args.debug:
+        logging.basicConfig(
+            stream=sys.stdout,
+            level=logging.DEBUG,
+            format="%(asctime)s [%(levelname)s] %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%S",
+        )
+        logger.debug("Debug logging enabled")
+
     # Sanity-check: warning must be strictly less than critical when both set.
     if args.warning is not None and args.critical is not None:
         if args.warning >= args.critical:
@@ -307,6 +346,12 @@ def main():
                 STATE_UNKNOWN,
                 "Warning threshold must be strictly less than critical threshold",
             )
+
+    logger.debug(
+        "Thresholds — warning: %s, critical: %s",
+        f"{args.warning}s" if args.warning is not None else "not set",
+        f"{args.critical}s" if args.critical is not None else "not set",
+    )
 
     # Connect to Redis.
     client = connect_redis(
@@ -327,12 +372,15 @@ def main():
 
     # No keys match — nothing to alert about.
     if not matching_keys:
+        logger.debug("No keys matched pattern '%s'", args.pattern)
         perfdata = build_perfdata(matched_keys=0)
         exit_plugin(
             STATE_OK,
             f"No keys matching pattern '{args.pattern}'",
             perfdata=perfdata,
         )
+
+    logger.debug("Fetching idle times for %d matched key(s)", len(matching_keys))
 
     # Collect idle times for every matched key.
     key_ages = {}
@@ -351,6 +399,8 @@ def main():
     num_keys = len(matching_keys)
     oldest_key = max(key_ages, key=lambda k: key_ages[k])
     oldest_age = key_ages[oldest_key]
+
+    logger.debug("Oldest key: '%s' with idle time %ds", oldest_key, oldest_age)
 
     perfdata = build_perfdata(
         matched_keys=num_keys,
